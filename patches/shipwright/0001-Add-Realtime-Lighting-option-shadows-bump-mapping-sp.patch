@@ -1,0 +1,114 @@
+From 0c66500aa53aced7c90d3fc77735b87a6926703c Mon Sep 17 00:00:00 2001
+From: Claude <mexicouger@gmail.com>
+Date: Sun, 4 Oct 2026 01:40:13 +0000
+Subject: [PATCH] Add Realtime Lighting option (shadows, bump mapping,
+ specular)
+
+Emits the new G_SCENEPOSTFX display list command at the end of the opaque
+world, using OoT's brighter directional light (sun by day, moon by night) as
+the light direction, and adds a Graphics menu section to control it. Requires
+the matching libultraship change. OpenGL / OpenGL ES renderer only.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CAmUXgE1XrEo1hGsHciUoa
+---
+ soh/soh/SohGui/SohMenuSettings.cpp | 40 ++++++++++++++++++++++++++++++
+ soh/src/code/z_play.c              | 31 +++++++++++++++++++++++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/soh/soh/SohGui/SohMenuSettings.cpp b/soh/soh/SohGui/SohMenuSettings.cpp
+index 476f99f3..7e00e3f7 100644
+--- a/soh/soh/SohGui/SohMenuSettings.cpp
++++ b/soh/soh/SohGui/SohMenuSettings.cpp
+@@ -429,6 +429,46 @@ void SohMenu::AddMenuSettings() {
+         .RaceDisable(false)
+         .Options(ComboboxOptions().Tooltip("Sets the applied Texture Filtering.").ComboMap(textureFilteringMap));
+ 
++    // Realtime lighting (screen-space shadows, bump mapping, specular). OpenGL / OpenGL ES renderer only.
++    AddWidget(path, "Realtime Lighting", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Enable Realtime Lighting", WIDGET_CVAR_CHECKBOX)
++        .CVar("gScenePostFx.Enabled")
++        .RaceDisable(false)
++        .Options(CheckboxOptions().Tooltip(
++            "Adds realtime sun/moon shadows, bump mapping and optional specular highlights to the world.\n"
++            "Only available with the OpenGL / OpenGL ES renderer, and is skipped while MSAA is enabled.\n"
++            "Costs extra GPU time; on mobile devices lower the shadow quality or internal resolution if needed."));
++    AddWidget(path, "Shadow Strength", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gScenePostFx.ShadowStrength")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions().Min(0.0f).Max(1.0f).DefaultValue(0.6f).IsPercentage().Tooltip(
++            "How dark shadows are. 0% disables shadows."));
++    AddWidget(path, "Shadow Distance", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gScenePostFx.ShadowDistance")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions().Min(20.0f).Max(600.0f).DefaultValue(200.0f).Format("%.0f").Tooltip(
++            "How far, in game units, the renderer looks for objects blocking the light."));
++    AddWidget(path, "Shadow Quality", WIDGET_CVAR_SLIDER_INT)
++        .CVar("gScenePostFx.ShadowSteps")
++        .RaceDisable(false)
++        .Options(IntSliderOptions().Min(4).Max(64).DefaultValue(16).Tooltip(
++            "Samples per pixel used to search for shadows. Higher is smoother but slower. 16 suits most handhelds."));
++    AddWidget(path, "Bump Mapping", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gScenePostFx.BumpStrength")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions().Min(0.0f).Max(2.0f).DefaultValue(0.6f).IsPercentage().Tooltip(
++            "Relief detail derived from the texture brightness. 0% disables bump mapping."));
++    AddWidget(path, "Flip Light Direction", WIDGET_CVAR_CHECKBOX)
++        .CVar("gScenePostFx.FlipLight")
++        .RaceDisable(false)
++        .Options(CheckboxOptions().Tooltip(
++            "Troubleshooting: enable this if shadows fall toward the sun/moon instead of away from it."));
++    AddWidget(path, "Specular Highlights", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gScenePostFx.SpecularStrength")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions().Min(0.0f).Max(1.0f).DefaultValue(0.0f).IsPercentage().Tooltip(
++            "Adds a shiny highlight from the sun/moon. 0% disables it."));
++
+     path.column = SECTION_COLUMN_2;
+     AddWidget(path, "Advanced Graphics Options", WIDGET_SEPARATOR_TEXT);
+ 
+diff --git a/soh/src/code/z_play.c b/soh/src/code/z_play.c
+index 37fc299d..0eaf0405 100644
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -1526,6 +1526,37 @@ void Play_Draw(PlayState* play) {
+             Actor_DrawAll(play, &play->actorCtx);
+         }
+ 
++        // Realtime shadows / bump mapping / specular. This runs as a screen-space pass over the opaque world, so it
++        // must come after the world and actors are drawn and before the HUD. The renderer reconstructs world-space
++        // positions from depth, so the light direction here is the same world-space direction the game lights with.
++        if (CVarGetInteger("gScenePostFx.Enabled", 0)) {
++            LightInfo* sun = &play->envCtx.dirLight1;
++            LightInfo* moon = &play->envCtx.dirLight2;
++            // Outdoors the sun is dirLight1 by day and the moon dirLight2 by night: use whichever is brighter.
++            if ((moon->params.dir.color[0] + moon->params.dir.color[1] + moon->params.dir.color[2]) >
++                (sun->params.dir.color[0] + sun->params.dir.color[1] + sun->params.dir.color[2])) {
++                sun = moon;
++            }
++
++            ScenePostFxParams* fx = Graph_Alloc(gfxCtx, sizeof(ScenePostFxParams));
++            f32 brightness = (sun->params.dir.color[0] + sun->params.dir.color[1] + sun->params.dir.color[2]) /
++                             (3.0f * 255.0f);
++            // The light vector should point toward the light (as the RSP expects); the option lets users flip it.
++            f32 dirSign = CVarGetInteger("gScenePostFx.FlipLight", 0) ? -1.0f : 1.0f;
++            fx->sunDir[0] = sun->params.dir.x * dirSign;
++            fx->sunDir[1] = sun->params.dir.y * dirSign;
++            fx->sunDir[2] = sun->params.dir.z * dirSign;
++            // A dim scene light casts a faint shadow.
++            fx->shadowStrength = CVarGetFloat("gScenePostFx.ShadowStrength", 0.6f) * fminf(1.0f, brightness * 2.0f);
++            fx->shadowDistance = CVarGetFloat("gScenePostFx.ShadowDistance", 200.0f);
++            fx->shadowThickness = CVarGetFloat("gScenePostFx.ShadowThickness", 80.0f);
++            fx->bumpStrength = CVarGetFloat("gScenePostFx.BumpStrength", 0.6f);
++            fx->specStrength = CVarGetFloat("gScenePostFx.SpecularStrength", 0.0f);
++            fx->specPower = CVarGetFloat("gScenePostFx.SpecularPower", 32.0f);
++            fx->shadowSteps = CVarGetInteger("gScenePostFx.ShadowSteps", 16);
++            gSPScenePostFx(POLY_OPA_DISP++, fx);
++        }
++
+         if ((HREG(80) != 10) || (HREG(86) != 0)) {
+             if (!play->envCtx.sunMoonDisabled) {
+                 sp21C.x = play->view.eye.x + play->envCtx.sunPos.x;
+-- 
+2.43.0
+

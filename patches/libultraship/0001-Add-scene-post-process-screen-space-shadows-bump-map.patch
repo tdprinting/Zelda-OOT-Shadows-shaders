@@ -1,0 +1,783 @@
+From 6d307cdb75a612feba4b1c4edc617692bbb60378 Mon Sep 17 00:00:00 2001
+From: Claude <mexicouger@gmail.com>
+Date: Sun, 4 Oct 2026 01:40:12 +0000
+Subject: [PATCH] Add scene post-process: screen-space shadows, bump mapping,
+ specular
+
+Fast3D transforms vertices on the CPU and discards world positions and
+normals, so a shadow-map pass would mean running every display list twice.
+Instead add an optional fullscreen pass over the finished world that
+rebuilds world-space positions from the depth buffer.
+
+* New display list command G_SCENEPOSTFX (0x4b) / gSPScenePostFx(), carrying
+  a ScenePostFxParams (sun direction, shadow and bump settings).
+* Interpreter captures the latest perspective view-projection and, when the
+  gScenePostFx.Enabled CVar is set, renders through the game framebuffer.
+* GfxRenderingAPI::ApplyScenePostFx() (default: unsupported). Implemented
+  for OpenGL and OpenGL ES 3.0 (GLSL ES 300 / 130 / 410 core).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CAmUXgE1XrEo1hGsHciUoa
+---
+ include/fast/backends/gfx_opengl.h        |  14 +
+ include/fast/backends/gfx_rendering_api.h |  17 +
+ include/fast/interpreter.h                |   8 +-
+ include/fast/lus_gbi.h                    |   1 +
+ include/libultraship/libultra/gbi.h       |  29 ++
+ src/fast/backends/gfx_opengl_scenefx.cpp  | 487 ++++++++++++++++++++++
+ src/fast/interpreter.cpp                  |  70 +++-
+ 7 files changed, 624 insertions(+), 2 deletions(-)
+ create mode 100644 src/fast/backends/gfx_opengl_scenefx.cpp
+
+diff --git a/include/fast/backends/gfx_opengl.h b/include/fast/backends/gfx_opengl.h
+index af24c70..6931f95 100644
+--- a/include/fast/backends/gfx_opengl.h
++++ b/include/fast/backends/gfx_opengl.h
+@@ -104,8 +104,12 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
+     FilteringMode GetTextureFilter() override;
+     void SetSrgbMode() override;
+     ImTextureID GetTextureById(int id) override;
++    bool ApplyScenePostFx(int fbId, const ScenePostFxArgs& args) override;
+ 
+   private:
++    bool EnsureScenePostFxResources(uint32_t width, uint32_t height);
++    void DestroyScenePostFxResources();
++
+     void SetUniforms(ShaderProgram* prg) const;
+     std::string BuildFsShader(const CCFeatures& cc_features);
+     void SetPerDrawUniforms();
+@@ -134,6 +138,16 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
+     float mCurrentNoiseScale = 0.0f;
+     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
+ 
++    // Scene post-process (screen-space shadows / bump / specular) resources
++    struct ScenePostFxState {
++        GLuint program = 0;
++        GLuint vao = 0;
++        GLuint fbo = 0, colorTex = 0, depthTex = 0;
++        uint32_t width = 0, height = 0;
++        bool broken = false; // creation failed once; don't retry every frame
++        GLint uColor, uDepth, uVP, uInvVP, uViewport, uZ, uInvertY, uSun, uShadow, uSurf, uSteps, uSize;
++    } mScenePostFx;
++
+     GLint mMaxMsaaLevel = 1;
+     GLuint mPixelDepthRb = 0;
+     GLuint mPixelDepthFb = 0;
+diff --git a/include/fast/backends/gfx_rendering_api.h b/include/fast/backends/gfx_rendering_api.h
+index 3eb0996..7a63c66 100644
+--- a/include/fast/backends/gfx_rendering_api.h
++++ b/include/fast/backends/gfx_rendering_api.h
+@@ -14,6 +14,18 @@ struct GfxClipParameters {
+     bool invertY;
+ };
+ 
++// Inputs for the optional scene post-process (screen-space shadows / bump / specular).
++// Matrices use the N64 row-vector convention (clip = v * M) with the same memory layout as RSP::P_matrix.
++struct ScenePostFxArgs {
++    float viewProj[4][4]; // view*projection captured from the last perspective projection of the frame
++    float aspectScaleX;   // horizontal correction Fast3D applied to clip-space x (4:3 -> window aspect)
++    float viewport[4];    // x, y, w, h in framebuffer pixels (GL convention, origin bottom-left)
++    float sunDir[3];      // world-space, toward the light
++    float shadowStrength, shadowDistance, shadowThickness;
++    float bumpStrength, specStrength, specPower;
++    int shadowSteps;
++};
++
+ enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
+ 
+ // A hash function used to hash a: pair<float, float>
+@@ -79,6 +91,11 @@ class GfxRenderingAPI {
+     virtual void SetSrgbMode() = 0;
+     virtual ImTextureID GetTextureById(int id) = 0;
+     virtual void SetCurrentPrimDepth(float depth) = 0;
++    // Relights the contents of the (non-MSAA, depth-buffered) framebuffer in place. Returns false if the backend
++    // doesn't support it, in which case nothing was changed.
++    virtual bool ApplyScenePostFx(int fbId, const ScenePostFxArgs& args) {
++        return false;
++    }
+ 
+   protected:
+     int8_t mCurrentDepthTest = 0;
+diff --git a/include/fast/interpreter.h b/include/fast/interpreter.h
+index 4c6a705..d57cc41 100644
+--- a/include/fast/interpreter.h
++++ b/include/fast/interpreter.h
+@@ -398,6 +398,9 @@ class Interpreter {
+     void CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr);
+     void ResetFrameBuffer();
+     void AdjustPixelDepthCoordinates(float& x, float& y);
++    // Runs the scene post-process (screen-space shadows/bump/specular) on the game framebuffer, if enabled.
++    // `params` points at a ScenePostFxParams from libultraship/libultra/gbi.h.
++    void ApplyScenePostFx(const void* params);
+     void GetPixelDepthPrepare(float x, float y);
+     uint16_t GetPixelDepth(float x, float y);
+     void RegisterBlendedTexture(const char* name, uint8_t* mask, uint8_t* replacement);
+@@ -535,7 +538,10 @@ class Interpreter {
+     uintptr_t mSegmentPointers[MAX_SEGMENT_POINTERS]{};
+ 
+     bool mFbActive{};
+-    bool mRendersToFb{}; // game_renders_to_framebuffer;
++    bool mRendersToFb{};         // game_renders_to_framebuffer;
++    bool mScenePostFxEnabled{};  // CVar-driven, forces rendering through the game framebuffer
++    bool mHasScenePerspective{}; // a perspective view-projection was loaded this frame
++    float mScenePerspVP[4][4]{}; // that view-projection (P_matrix at the time it was last loaded)
+     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
+     std::map<int, FBInfo> mFrameBuffers;
+ 
+diff --git a/include/fast/lus_gbi.h b/include/fast/lus_gbi.h
+index 77bdf8b..ecf2568 100644
+--- a/include/fast/lus_gbi.h
++++ b/include/fast/lus_gbi.h
+@@ -75,6 +75,7 @@ constexpr int8_t RDP_G_LOADBLOCK_WIDE = OPCODE(0x47);
+ constexpr int8_t RDP_G_VTX_WIDE = OPCODE(0x48);
+ constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
+ constexpr int8_t RDP_G_SETTILESIZE_LERP = OPCODE(0x4a);
++constexpr int8_t OTR_G_SCENEPOSTFX = OPCODE(0x4b);
+ 
+ /*
+  * The following commands are the "generated" RDP commands; the user
+diff --git a/include/libultraship/libultra/gbi.h b/include/libultraship/libultra/gbi.h
+index 6beda75..d4855c6 100644
+--- a/include/libultraship/libultra/gbi.h
++++ b/include/libultraship/libultra/gbi.h
+@@ -197,6 +197,7 @@
+ #define G_SETTILESIZE_INTERP 0x45
+ #define G_SETTARGETINTERPINDEX 0x46
+ #define G_SETTILESIZE_LERP 0x4a
++#define G_SCENEPOSTFX 0x4b
+ 
+ /*
+  * The following commands are the "generated" RDP commands; the user
+@@ -2830,6 +2831,34 @@ typedef union Gfx {
+ #define gsSPGrayscale(state) \
+     { (_SHIFTL(G_SETGRAYSCALE, 24, 8)), (state) }
+ 
++/*
++ * Scene post-processing (screen-space shadows, bump mapping, specular).
++ * Place at the end of the world's opaque display list, before any HUD drawing. The renderer reconstructs
++ * world-space positions from the depth buffer, so the sun direction must be in the same space as the
++ * model matrices (world space for OoT). The pointed-to struct must remain valid until the frame is rendered.
++ */
++typedef struct ScenePostFxParams {
++    float sunDir[3];       /* world-space direction pointing toward the light, need not be normalized */
++    float shadowStrength;  /* 0 disables shadows, 1 is fully black */
++    float shadowDistance;  /* how far (world units) to search for occluders along the light direction */
++    float shadowThickness; /* occluders thicker than this (view-depth units) are ignored */
++    float bumpStrength;    /* 0 disables bump mapping */
++    float specStrength;    /* 0 disables specular */
++    float specPower;       /* specular exponent */
++    int32_t shadowSteps;   /* ray-march samples per pixel (cost scales linearly) */
++} ScenePostFxParams;
++
++#define gSPScenePostFx(pkt, params)                   \
++    {                                                 \
++        Gfx* _g = (Gfx*)(pkt);                        \
++                                                      \
++        _g->words.w0 = _SHIFTL(G_SCENEPOSTFX, 24, 8); \
++        _g->words.w1 = (uintptr_t)(params);           \
++    }
++
++#define gsSPScenePostFx(params) \
++    { (_SHIFTL(G_SCENEPOSTFX, 24, 8)), (uintptr_t)(params) }
++
+ #define gsSPPushShader(shader)                                  \
+     { (_SHIFTL(G_PUSH_SHADER, 24, 8)), (uintptr_t)(shader) }, { \
+         0, 0                                                    \
+diff --git a/src/fast/backends/gfx_opengl_scenefx.cpp b/src/fast/backends/gfx_opengl_scenefx.cpp
+new file mode 100644
+index 0000000..fb1cc32
+--- /dev/null
++++ b/src/fast/backends/gfx_opengl_scenefx.cpp
+@@ -0,0 +1,487 @@
++// Scene post-process for the OpenGL / OpenGL ES backend.
++//
++// Fast3D transforms vertices on the CPU and drops normals and world positions before they reach the GPU, so a
++// classic shadow-map pass would mean running every display list a second time. Instead we run one fullscreen pass
++// over the finished world geometry that rebuilds world-space positions from the depth buffer and uses them to add:
++//   * screen-space sun shadows (a short ray march through the depth buffer toward the light),
++//   * bump mapping (the surface normal is perturbed by the luminance gradient of the rendered texels),
++//   * an optional specular highlight.
++// One pass, no extra geometry, and it works on top of every existing N64 shader permutation. GLSL is ES 3.00
++// compatible, so it also runs on Adreno (Android) GPUs.
++
++#include "ship/window/Window.h"
++#ifdef ENABLE_OPENGL
++
++#include <cmath>
++#include <cstring>
++#include <string>
++
++#ifndef _LANGUAGE_C
++#define _LANGUAGE_C
++#endif
++
++#ifdef __MINGW32__
++#define FOR_WINDOWS 1
++#else
++#define FOR_WINDOWS 0
++#endif
++
++#include "fast/backends/gfx_opengl.h"
++#include <spdlog/spdlog.h>
++
++namespace Fast {
++
++#if defined(__APPLE__)
++#define FX_GLSL_VERSION "#version 410 core\n"
++#define FX_GLSL_PRECISION ""
++#elif defined(USE_OPENGLES)
++#define FX_GLSL_VERSION "#version 300 es\n"
++#define FX_GLSL_PRECISION "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\n"
++#else
++#define FX_GLSL_VERSION "#version 130\n"
++#define FX_GLSL_PRECISION ""
++#endif
++
++static const char* kScenePostFxVs = FX_GLSL_VERSION FX_GLSL_PRECISION R"GLSL(
++void main() {
++    // Fullscreen triangle from gl_VertexID, no vertex buffer needed.
++    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++)GLSL";
++
++static const char* kScenePostFxFs = FX_GLSL_VERSION FX_GLSL_PRECISION R"GLSL(
++out vec4 fragColor;
++
++uniform sampler2D uColor;
++uniform sampler2D uDepth;
++uniform mat4 uVP;       // eye-relative view-projection (row-vector matrix uploaded as-is)
++uniform mat4 uInvVP;
++uniform vec4 uViewport; // x, y, w, h in pixels
++uniform vec2 uZ;        // ndc_z = uZ.x + uZ.y / clip_w
++uniform float uInvertY; // -1 when the framebuffer is stored upside down
++uniform vec3 uSun;      // normalized, toward the light
++uniform vec3 uShadow;   // strength, distance, thickness
++uniform vec3 uSurf;     // bump strength, specular strength, specular power
++uniform int uSteps;
++uniform ivec2 uSize;
++
++const float SKY = 0.99999;
++
++float depthAt(ivec2 p) {
++    return texelFetch(uDepth, clamp(p, ivec2(0), uSize - ivec2(1)), 0).r;
++}
++
++float heightAt(ivec2 p) {
++    return dot(texelFetch(uColor, clamp(p, ivec2(0), uSize - ivec2(1)), 0).rgb, vec3(0.299, 0.587, 0.114));
++}
++
++// Eye-relative world position of a pixel centre at a given depth-buffer value.
++vec3 unproject(vec2 px, float d) {
++    vec2 ndc = (px - uViewport.xy) / uViewport.zw * 2.0 - 1.0;
++    ndc.y *= uInvertY;
++    vec4 h = uInvVP * vec4(ndc, d * 2.0 - 1.0, 1.0);
++    return h.xyz / h.w;
++}
++
++void main() {
++    ivec2 ip = ivec2(gl_FragCoord.xy);
++    vec3 base = texelFetch(uColor, ip, 0).rgb;
++    float d0 = depthAt(ip);
++    if (d0 >= SKY) {
++        fragColor = vec4(base, 1.0);
++        return;
++    }
++
++    vec2 c = vec2(ip) + 0.5;
++    vec3 P = unproject(c, d0);
++    float dist = length(P);
++
++    // Geometric normal from the nearer neighbour on each axis (avoids smearing across depth edges).
++    float dR = depthAt(ip + ivec2(1, 0)), dL = depthAt(ip - ivec2(1, 0));
++    float dU = depthAt(ip + ivec2(0, 1)), dD = depthAt(ip - ivec2(0, 1));
++    vec3 PR = unproject(c + vec2(1.0, 0.0), dR), PL = unproject(c - vec2(1.0, 0.0), dL);
++    vec3 PU = unproject(c + vec2(0.0, 1.0), dU), PD = unproject(c - vec2(0.0, 1.0), dD);
++    float eR = abs(length(PR) - dist), eL = abs(length(PL) - dist);
++    float eU = abs(length(PU) - dist), eD = abs(length(PD) - dist);
++    vec3 ex = eR < eL ? PR - P : P - PL;
++    vec3 ey = eU < eD ? PU - P : P - PD;
++    float edgeLimit = 0.06 * dist + 2.0;
++    bool smoothSurface = min(eR, eL) < edgeLimit && min(eU, eD) < edgeLimit &&
++                         dR < SKY && dL < SKY && dU < SKY && dD < SKY;
++
++    vec3 N = normalize(cross(ex, ey));
++    if (dot(N, P) > 0.0) N = -N; // face the eye (eye is the origin, so the eye direction is -P)
++    if (!smoothSurface) N = normalize(-P);
++
++    vec3 L = normalize(uSun);
++    float nl = dot(N, L);
++
++    // ---- bump mapping ----
++    vec3 Np = N;
++    float gain = 1.0;
++    if (uSurf.x > 0.0 && smoothSurface) {
++        float gx = clamp(0.5 * (heightAt(ip + ivec2(1, 0)) - heightAt(ip - ivec2(1, 0))), -0.25, 0.25);
++        float gy = clamp(0.5 * (heightAt(ip + ivec2(0, 1)) - heightAt(ip - ivec2(0, 1))), -0.25, 0.25);
++        vec3 T = normalize(ex - N * dot(ex, N));
++        vec3 B = normalize(ey - N * dot(ey, N));
++        Np = normalize(N - uSurf.x * 3.0 * (gx * T + gy * B));
++        gain = clamp(1.0 + (dot(Np, L) - nl) * 0.9, 0.5, 1.5);
++    }
++
++    // ---- screen-space sun shadow ----
++    float shadow = 0.0;
++    if (uShadow.x > 0.0 && uSteps > 0 && smoothSurface) {
++        float bias = 0.004 * dist + 0.5;
++        vec3 origin = P + N * bias;
++        float stepLen = uShadow.y / float(uSteps);
++        float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
++        for (int i = 0; i < 64; i++) {
++            if (i >= uSteps) break;
++            float t = (float(i) + jitter) * stepLen + stepLen * 0.5;
++            vec4 cq = uVP * vec4(origin + L * t, 1.0);
++            if (cq.w <= 0.0) break;
++            vec2 ndc = cq.xy / cq.w;
++            ndc.y *= uInvertY;
++            vec2 px = (ndc * 0.5 + 0.5) * uViewport.zw + uViewport.xy;
++            if (px.x < uViewport.x || px.y < uViewport.y || px.x >= uViewport.x + uViewport.z ||
++                px.y >= uViewport.y + uViewport.w) break;
++            float sd = depthAt(ivec2(px));
++            if (sd >= SKY) continue;
++            float wScene = uZ.y / (sd * 2.0 - 1.0 - uZ.x);
++            float diff = cq.w - wScene; // > 0: the scene surface is in front of the ray sample
++            if (diff > 0.004 * cq.w + 0.5 && diff < uShadow.z) {
++                shadow = max(shadow, 1.0 - 0.6 * (t / uShadow.y));
++                break;
++            }
++        }
++        shadow *= smoothstep(0.0, 0.2, nl); // surfaces facing away from the sun are already dark
++    }
++
++    vec3 col = base * gain * (1.0 - uShadow.x * shadow);
++
++    // ---- specular ----
++    if (uSurf.y > 0.0 && smoothSurface) {
++        vec3 V = normalize(-P);
++        vec3 H = normalize(L + V);
++        float spec = pow(max(dot(Np, H), 0.0), max(uSurf.z, 1.0)) * uSurf.y;
++        spec *= (1.0 - shadow) * smoothstep(0.0, 0.2, nl);
++        col += spec * mix(vec3(1.0), base, 0.5);
++    }
++
++    fragColor = vec4(col, 1.0);
++}
++)GLSL";
++
++static GLuint CompileStage(GLenum type, const char* src) {
++    GLuint sh = glCreateShader(type);
++    glShaderSource(sh, 1, &src, nullptr);
++    glCompileShader(sh);
++    GLint ok = 0;
++    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[2048];
++        glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
++        SPDLOG_ERROR("Scene post-process {} shader failed to compile: {}",
++                     type == GL_VERTEX_SHADER ? "vertex" : "fragment", log);
++        glDeleteShader(sh);
++        return 0;
++    }
++    return sh;
++}
++
++// 4x4 inverse (double precision, cofactor expansion). Returns false if singular.
++static bool Invert4x4(const double m[16], double out[16]) {
++    double inv[16];
++    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] +
++             m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
++    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] -
++             m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
++    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] +
++             m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
++    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] -
++              m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
++    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] -
++             m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
++    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] +
++             m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
++    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] -
++             m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
++    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] +
++              m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
++    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] +
++             m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
++    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] -
++             m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
++    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] +
++              m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
++    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] -
++              m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
++    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] -
++             m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
++    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] +
++             m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
++    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] -
++              m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
++    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] -
++              m[8] * m[2] * m[5];
++    double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
++    if (std::fabs(det) < 1e-30) {
++        return false;
++    }
++    det = 1.0 / det;
++    for (int i = 0; i < 16; i++) {
++        out[i] = inv[i] * det;
++    }
++    return true;
++}
++
++void GfxRenderingAPIOGL::DestroyScenePostFxResources() {
++    auto& fx = mScenePostFx;
++    if (fx.program)
++        glDeleteProgram(fx.program);
++    if (fx.vao)
++        glDeleteVertexArrays(1, &fx.vao);
++    if (fx.fbo)
++        glDeleteFramebuffers(1, &fx.fbo);
++    if (fx.colorTex)
++        glDeleteTextures(1, &fx.colorTex);
++    if (fx.depthTex)
++        glDeleteTextures(1, &fx.depthTex);
++    fx = ScenePostFxState{};
++}
++
++bool GfxRenderingAPIOGL::EnsureScenePostFxResources(uint32_t width, uint32_t height) {
++    auto& fx = mScenePostFx;
++    if (fx.broken) {
++        return false;
++    }
++
++    if (fx.program == 0) {
++        GLuint vs = CompileStage(GL_VERTEX_SHADER, kScenePostFxVs);
++        GLuint fs = CompileStage(GL_FRAGMENT_SHADER, kScenePostFxFs);
++        if (!vs || !fs) {
++            if (vs)
++                glDeleteShader(vs);
++            if (fs)
++                glDeleteShader(fs);
++            fx.broken = true;
++            return false;
++        }
++        GLuint prog = glCreateProgram();
++        glAttachShader(prog, vs);
++        glAttachShader(prog, fs);
++        glLinkProgram(prog);
++        glDeleteShader(vs);
++        glDeleteShader(fs);
++        GLint ok = 0;
++        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
++        if (!ok) {
++            char log[2048];
++            glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
++            SPDLOG_ERROR("Scene post-process program failed to link: {}", log);
++            glDeleteProgram(prog);
++            fx.broken = true;
++            return false;
++        }
++        fx.program = prog;
++        fx.uColor = glGetUniformLocation(prog, "uColor");
++        fx.uDepth = glGetUniformLocation(prog, "uDepth");
++        fx.uVP = glGetUniformLocation(prog, "uVP");
++        fx.uInvVP = glGetUniformLocation(prog, "uInvVP");
++        fx.uViewport = glGetUniformLocation(prog, "uViewport");
++        fx.uZ = glGetUniformLocation(prog, "uZ");
++        fx.uInvertY = glGetUniformLocation(prog, "uInvertY");
++        fx.uSun = glGetUniformLocation(prog, "uSun");
++        fx.uShadow = glGetUniformLocation(prog, "uShadow");
++        fx.uSurf = glGetUniformLocation(prog, "uSurf");
++        fx.uSteps = glGetUniformLocation(prog, "uSteps");
++        fx.uSize = glGetUniformLocation(prog, "uSize");
++        glGenVertexArrays(1, &fx.vao);
++        glGenFramebuffers(1, &fx.fbo);
++        glGenTextures(1, &fx.colorTex);
++        glGenTextures(1, &fx.depthTex);
++    }
++
++    if (fx.width != width || fx.height != height) {
++        GLint prevTex = 0;
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
++
++        glBindTexture(GL_TEXTURE_2D, fx.colorTex);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++        glBindTexture(GL_TEXTURE_2D, fx.depthTex);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, width, height, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8,
++                     nullptr);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glBindTexture(GL_TEXTURE_2D, prevTex);
++
++        glBindFramebuffer(GL_FRAMEBUFFER, fx.fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fx.colorTex, 0);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, fx.depthTex, 0);
++        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++        glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
++        if (status != GL_FRAMEBUFFER_COMPLETE) {
++            SPDLOG_ERROR("Scene post-process scratch framebuffer incomplete (0x{:x}); disabling effect",
++                         (unsigned)status);
++            DestroyScenePostFxResources();
++            mScenePostFx.broken = true;
++            return false;
++        }
++        fx.width = width;
++        fx.height = height;
++    }
++    return true;
++}
++
++bool GfxRenderingAPIOGL::ApplyScenePostFx(int fb_id, const ScenePostFxArgs& a) {
++    if (fb_id <= 0 || fb_id >= (int)mFrameBuffers.size()) {
++        return false;
++    }
++    const FramebufferOGL& fb = mFrameBuffers[fb_id];
++    if (!fb.has_depth_buffer || fb.msaa_level > 1 || (int)mCurrentFrameBuffer != fb_id) {
++        return false;
++    }
++    if (a.viewport[2] < 1.0f || a.viewport[3] < 1.0f || !EnsureScenePostFxResources(fb.width, fb.height)) {
++        return false;
++    }
++    auto& fx = mScenePostFx;
++
++    // ---- matrices ----
++    // Fold in what Fast3D does to clip space after the RSP transform: x is rescaled for the window aspect, and on
++    // GLES the vertex shader squashes z by 0.3.
++    double M[16];
++    for (int r = 0; r < 4; r++) {
++        for (int c = 0; c < 4; c++) {
++            M[r * 4 + c] = a.viewProj[r][c];
++        }
++        M[r * 4 + 0] *= a.aspectScaleX;
++#ifdef USE_OPENGLES
++        M[r * 4 + 2] *= 0.3;
++#endif
++    }
++    double Minv[16];
++    if (!Invert4x4(M, Minv)) {
++        return false;
++    }
++    // Camera position: the point whose clip-space w is 0 and which sits on the view axis, i.e. [0,0,1,0] * Minv.
++    if (std::fabs(Minv[2 * 4 + 3]) < 1e-12) {
++        return false;
++    }
++    double eye[3] = { Minv[8] / Minv[11], Minv[9] / Minv[11], Minv[10] / Minv[11] };
++    // Make the matrix eye-relative so positions stay small (float precision) even far from the world origin.
++    double Mr[16];
++    std::memcpy(Mr, M, sizeof(Mr));
++    for (int c = 0; c < 4; c++) {
++        Mr[12 + c] = eye[0] * M[0 * 4 + c] + eye[1] * M[1 * 4 + c] + eye[2] * M[2 * 4 + c] + M[12 + c];
++    }
++    double MrInv[16];
++    if (!Invert4x4(Mr, MrInv)) {
++        return false;
++    }
++    // clip_z = k1 * clip_w + k0 for a view-projection product; lets the shader turn depth into linear depth.
++    int row = 0;
++    for (int r = 1; r < 3; r++) {
++        if (std::fabs(Mr[r * 4 + 3]) > std::fabs(Mr[row * 4 + 3]))
++            row = r;
++    }
++    if (std::fabs(Mr[row * 4 + 3]) < 1e-9) {
++        return false;
++    }
++    double k1 = Mr[row * 4 + 2] / Mr[row * 4 + 3];
++    double k0 = Mr[12 + 2] - k1 * Mr[12 + 3];
++
++    float vp[16], ivp[16];
++    for (int i = 0; i < 16; i++) {
++        vp[i] = (float)Mr[i];
++        ivp[i] = (float)MrInv[i];
++    }
++
++    float sun[3] = { a.sunDir[0], a.sunDir[1], a.sunDir[2] };
++    float sunLen = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
++    bool haveSun = sunLen > 1e-5f;
++    if (haveSun) {
++        for (float& f : sun)
++            f /= sunLen;
++    } else {
++        sun[0] = sun[2] = 0.0f;
++        sun[1] = 1.0f;
++    }
++    int steps = a.shadowSteps < 0 ? 0 : (a.shadowSteps > 64 ? 64 : a.shadowSteps);
++    float shadowStrength = haveSun ? a.shadowStrength : 0.0f;
++
++    // ---- save the GL state the interpreter's caches rely on ----
++    GLint prevProgram = 0, prevVao = 0, prevActive = 0, prevTex[2] = {};
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
++    for (int i = 0; i < 2; i++) {
++        glActiveTexture(GL_TEXTURE0 + i);
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex[i]);
++    }
++
++    // ---- snapshot color+depth of the finished world into the scratch target ----
++    glDisable(GL_SCISSOR_TEST);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fx.fbo);
++    glBlitFramebuffer(0, 0, fb.width, fb.height, 0, 0, fb.width, fb.height, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
++                      GL_NEAREST);
++    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
++
++    // ---- relight back into the game framebuffer ----
++    glViewport((GLint)a.viewport[0], (GLint)a.viewport[1], (GLsizei)a.viewport[2], (GLsizei)a.viewport[3]);
++    glEnable(GL_SCISSOR_TEST);
++    glScissor((GLint)a.viewport[0], (GLint)a.viewport[1], (GLsizei)a.viewport[2], (GLsizei)a.viewport[3]);
++    glDisable(GL_DEPTH_TEST);
++    glDepthMask(GL_FALSE);
++    glDisable(GL_BLEND);
++
++    glUseProgram(fx.program);
++    glBindVertexArray(fx.vao);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, fx.colorTex);
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(GL_TEXTURE_2D, fx.depthTex);
++
++    glUniform1i(fx.uColor, 0);
++    glUniform1i(fx.uDepth, 1);
++    glUniformMatrix4fv(fx.uVP, 1, GL_FALSE, vp);
++    glUniformMatrix4fv(fx.uInvVP, 1, GL_FALSE, ivp);
++    glUniform4f(fx.uViewport, a.viewport[0], a.viewport[1], a.viewport[2], a.viewport[3]);
++    glUniform2f(fx.uZ, (float)k1, (float)k0);
++    glUniform1f(fx.uInvertY, fb.invertY ? -1.0f : 1.0f);
++    glUniform3f(fx.uSun, sun[0], sun[1], sun[2]);
++    glUniform3f(fx.uShadow, shadowStrength, a.shadowDistance, a.shadowThickness);
++    glUniform3f(fx.uSurf, a.bumpStrength, a.specStrength, a.specPower);
++    glUniform1i(fx.uSteps, steps);
++    glUniform2i(fx.uSize, (GLint)fb.width, (GLint)fb.height);
++
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++
++    // ---- restore ----
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, prevTex[0]);
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(GL_TEXTURE_2D, prevTex[1]);
++    glActiveTexture(prevActive);
++    glBindVertexArray(prevVao);
++    glUseProgram(prevProgram);
++
++    // Depth/blend/scissor state is cached lazily by this backend; invalidate so it is re-applied on the next draw.
++    mLastDepthTest = -1;
++    mLastDepthMask = -1;
++    mLastZmodeDecal = -1;
++    mLastBlendEnabled = -1;
++    mLastScissorEnabled = 1; // left enabled above
++    return true;
++}
++
++} // namespace Fast
++#endif
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index 2b51ad7..ed03ac0 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -1537,6 +1537,60 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
+         mRsp->lights_changed = 1;
+     }
+     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
++
++    // Remember the latest perspective view-projection (w comes from z) so the scene post-process can unproject
++    // depth back to world space. Orthographic matrices (HUD, menus) are ignored.
++    if ((parameters & mtx_projection) && fabsf(mRsp->P_matrix[2][3]) > 1e-4f) {
++        memcpy(mScenePerspVP, mRsp->P_matrix, sizeof(mScenePerspVP));
++        mHasScenePerspective = true;
++    }
++}
++
++// Layout-identical to ScenePostFxParams in libultraship/libultra/gbi.h (kept separate to avoid pulling that header
++// into this translation unit).
++struct ScenePostFxParamsHost {
++    float sunDir[3];
++    float shadowStrength;
++    float shadowDistance;
++    float shadowThickness;
++    float bumpStrength;
++    float specStrength;
++    float specPower;
++    int32_t shadowSteps;
++};
++static_assert(sizeof(ScenePostFxParamsHost) == 40, "ScenePostFxParams layout changed");
++
++void Interpreter::ApplyScenePostFx(const void* paramsPtr) {
++    // Needs the game framebuffer (so we have a readable depth buffer) and a perspective scene. If the game is
++    // currently drawing into a secondary framebuffer, or MSAA is on, just skip.
++    if (paramsPtr == nullptr || !mScenePostFxEnabled || !mRendersToFb || mFbActive || mMsaaLevel > 1 ||
++        !mHasScenePerspective) {
++        return;
++    }
++    const auto* p = static_cast<const ScenePostFxParamsHost*>(paramsPtr);
++
++    ScenePostFxArgs a{};
++    memcpy(a.viewProj, mScenePerspVP, sizeof(a.viewProj));
++    a.aspectScaleX = AdjXForAspectRatio(1.0f);
++    a.viewport[0] = (float)mRdp->viewport.x;
++    a.viewport[1] = (float)mRdp->viewport.y;
++    a.viewport[2] = (float)mRdp->viewport.width;
++    a.viewport[3] = (float)mRdp->viewport.height;
++    memcpy(a.sunDir, p->sunDir, sizeof(a.sunDir));
++    a.shadowStrength = p->shadowStrength;
++    a.shadowDistance = p->shadowDistance;
++    a.shadowThickness = p->shadowThickness;
++    a.bumpStrength = p->bumpStrength;
++    a.specStrength = p->specStrength;
++    a.specPower = p->specPower;
++    a.shadowSteps = p->shadowSteps;
++
++    if (mRapi->ApplyScenePostFx(mGameFb, a)) {
++        // The backend changed viewport/scissor/program state behind our back; force it to be re-applied.
++        mRdp->viewport_or_scissor_changed = true;
++        mRenderingState.viewport = {};
++        mRenderingState.scissor = {};
++    }
+ }
+ 
+ void Interpreter::GfxSpPopMatrix(uint32_t count) {
+@@ -4436,6 +4490,15 @@ bool gfx_set_fill_color_handler_rdp(F3DGfx** cmd0) {
+     return false;
+ }
+ 
++bool gfx_scene_postfx_handler_custom(F3DGfx** cmd0) {
++    Interpreter* gfx = mInstance.lock().get();
++    F3DGfx* cmd = *cmd0;
++
++    gfx->Flush();
++    gfx->ApplyScenePostFx((const void*)cmd->words.w1);
++    return false;
++}
++
+ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
+     Interpreter* gfx = mInstance.lock().get();
+     F3DGfx* cmd = *cmd0;
+@@ -4719,6 +4782,7 @@ static constexpr UcodeHandler otrHandlers = {
+     { OTR_G_REGBLENDEDTEX,
+       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
+     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
++    { OTR_G_SCENEPOSTFX, { "G_SCENEPOSTFX", gfx_scene_postfx_handler_custom } },    // G_SCENEPOSTFX (0x4b)
+     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
+     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
+     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
+@@ -5064,7 +5128,11 @@ void Interpreter::StartFrame() {
+ 
+     mPrvDimensions = mCurDimensions;
+     mPrevNativeDimensions = mNativeDimensions;
+-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
++    mScenePostFxEnabled =
++        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gScenePostFx.Enabled", 0) != 0 &&
++        mMsaaLevel <= 1;
++    mHasScenePerspective = false;
++    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || mScenePostFxEnabled) {
+         mRendersToFb = true;
+         if (!ViewportMatchesRendererResolution()) {
+             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
+-- 
+2.43.0
+
