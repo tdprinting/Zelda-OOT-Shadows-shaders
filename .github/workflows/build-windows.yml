@@ -1,0 +1,94 @@
+name: build-windows
+# Builds Ship of Harkinian with the Realtime Lighting patches and uploads a Windows zip.
+# Run it from the Actions tab (workflow_dispatch) or by pushing to this branch.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'claude/**' ]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Upstream Shipwright commit the patches were made against.
+  SHIPWRIGHT_REF: 31c0d85544ea68fcd376e49845ed8f943bcddbda
+
+jobs:
+  generate-soh-otr:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout patches
+      uses: actions/checkout@v4
+      with:
+        path: patches-repo
+    - name: Checkout Shipwright
+      run: |
+        git init sw && cd sw
+        git remote add origin https://github.com/HarbourMasters/Shipwright.git
+        git fetch --depth 1 origin "$SHIPWRIGHT_REF"
+        git checkout FETCH_HEAD
+        git submodule update --init --depth 1
+        "$GITHUB_WORKSPACE/patches-repo/scripts/apply.sh" .
+    - name: Install dependencies
+      working-directory: sw
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y $(cat linux-build-deps/apt.txt)
+    - name: Generate soh.o2r
+      working-directory: sw
+      run: |
+        cmake --no-warn-unused-cli -H. -Bbuild-cmake -GNinja -DCMAKE_BUILD_TYPE:STRING=Release -DSOH_TOOLS_ONLY=ON
+        cmake --build build-cmake --config Release --target GenerateSohOtr -j4
+    - uses: actions/upload-artifact@v4
+      with:
+        name: soh.o2r
+        path: sw/soh.o2r
+        retention-days: 3
+
+  build-windows:
+    needs: generate-soh-otr
+    runs-on: windows-latest
+    steps:
+    - name: Install dependencies
+      run: |
+        choco install ninja -y
+        Remove-Item -Path "C:\ProgramData\Chocolatey\bin\ccache.exe" -Force -ErrorAction SilentlyContinue
+    - name: Checkout patches
+      uses: actions/checkout@v4
+      with:
+        path: patches-repo
+    - name: Checkout Shipwright and apply patches
+      shell: bash
+      run: |
+        git init sw && cd sw
+        git remote add origin https://github.com/HarbourMasters/Shipwright.git
+        git fetch --depth 1 origin "$SHIPWRIGHT_REF"
+        git checkout FETCH_HEAD
+        git submodule update --init --depth 1
+        "$GITHUB_WORKSPACE/patches-repo/scripts/apply.sh" .
+    - name: Configure Developer Command Prompt
+      uses: TheMrMilchmann/setup-msvc-dev@v4
+      with:
+        arch: x64
+    - name: Download soh.o2r
+      uses: actions/download-artifact@v4
+      with:
+        name: soh.o2r
+        path: sw/build-windows/soh
+    - name: Build SoH
+      working-directory: sw
+      env:
+        VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      run: |
+        cmake -S . -B build-windows -G Ninja -DCMAKE_MAKE_PROGRAM=ninja -DCMAKE_BUILD_TYPE:STRING=Release
+        cmake --build build-windows --config Release --parallel 4
+        (cd build-windows && cpack)
+        cd ..
+        mv _packages/*.zip _packages/soh-windows.zip
+    - name: Unzip package
+      working-directory: sw
+      run: Expand-Archive -Path _packages/soh-windows.zip -DestinationPath ../soh-windows
+    - uses: actions/upload-artifact@v4
+      with:
+        name: soh-windows-realtime-lighting
+        path: soh-windows
